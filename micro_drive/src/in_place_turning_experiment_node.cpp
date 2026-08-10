@@ -9,6 +9,7 @@
 #include <cmath>
 #include <deque>
 #include <geometry_msgs/msg/transform_stamped.hpp>
+#include <geometry_msgs/msg/twist.hpp>
 #include <geometry_msgs/msg/twist_stamped.hpp>
 #include <iomanip>
 #include <rclcpp/rclcpp.hpp>
@@ -51,6 +52,7 @@ class InPlaceTurningExperimentNode : public rclcpp::Node {
     declare_parameter("gyro_window_size", 20);
     declare_parameter("max_imu_delta_seconds", 0.1);
     declare_parameter("invert_rotation", false);
+    declare_parameter("use_twist_stamped", true);
 
     // Getting params
     start_angular_velocity_rad_ = get_parameter("start_angular_velocity_rad").as_double();
@@ -66,6 +68,7 @@ class InPlaceTurningExperimentNode : public rclcpp::Node {
     gyro_window_size_ = get_parameter("gyro_window_size").as_int();
     max_imu_delta_seconds_ = get_parameter("max_imu_delta_seconds").as_double();
     invert_rotation_ = get_parameter("invert_rotation").as_bool();
+    use_twist_stamped_ = get_parameter("use_twist_stamped").as_bool();
 
     // Validation
     if (stopping_model_ != "baseline" && stopping_model_ != "deadtime") {
@@ -129,7 +132,11 @@ class InPlaceTurningExperimentNode : public rclcpp::Node {
         std::bind(&InPlaceTurningExperimentNode::lock_callback, this, std::placeholders::_1));
 
     // Publishers
-    cmd_vel_pub_ = create_publisher<geometry_msgs::msg::TwistStamped>("/controller/cmd_vel", 10);
+    if (use_twist_stamped_) {
+      cmd_vel_stamped_pub_ = create_publisher<geometry_msgs::msg::TwistStamped>("/controller/cmd_vel", 10);
+    } else {
+      cmd_vel_pub_ = create_publisher<geometry_msgs::msg::Twist>("/controller/cmd_vel", 10);
+    }
     state_pub_ = create_publisher<std_msgs::msg::Int32>("~/state", 10);
     current_yaw_pub_ = create_publisher<std_msgs::msg::Float64>("~/current_yaw", 200);
     estimated_yaw_vel_pub_ = create_publisher<std_msgs::msg::Float64>("~/estimated_yaw_vel", 200);
@@ -240,18 +247,27 @@ class InPlaceTurningExperimentNode : public rclcpp::Node {
          << "\"base_frame\":\"" << base_frame_ << "\","
          << "\"gyro_window_size\":" << gyro_window_size_ << ","
          << "\"max_imu_delta_seconds\":" << max_imu_delta_seconds_ << ","
-         << "\"invert_rotation\":" << (invert_rotation_ ? "true" : "false") << "}";
+         << "\"invert_rotation\":" << (invert_rotation_ ? "true" : "false") << ","
+         << "\"use_twist_stamped\":" << (use_twist_stamped_ ? "true" : "false") << "}";
     return json.str();
   }
 
   // Publishes the current commanded velocity and state at a fixed rate.
   // Zero velocity is published when not rotating, keeping the controller fed.
   void timer_callback() {
-    geometry_msgs::msg::TwistStamped cmd_msg;
-    cmd_msg.header.stamp = now();
-    cmd_msg.header.frame_id = base_frame_;
-    cmd_msg.twist.angular.z = invert_rotation_ ? -commanded_velocity_ : commanded_velocity_;
-    cmd_vel_pub_->publish(cmd_msg);
+    const double angular_z = invert_rotation_ ? -commanded_velocity_ : commanded_velocity_;
+
+    if (use_twist_stamped_) {
+      geometry_msgs::msg::TwistStamped cmd_msg;
+      cmd_msg.header.stamp = now();
+      cmd_msg.header.frame_id = base_frame_;
+      cmd_msg.twist.angular.z = angular_z;
+      cmd_vel_stamped_pub_->publish(cmd_msg);
+    } else {
+      geometry_msgs::msg::Twist cmd_msg;
+      cmd_msg.angular.z = angular_z;
+      cmd_vel_pub_->publish(cmd_msg);
+    }
 
     std_msgs::msg::Int32 state_msg;
     state_msg.data = static_cast<int>(state_);
@@ -375,7 +391,8 @@ class InPlaceTurningExperimentNode : public rclcpp::Node {
 
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr lock_sub_;
-  rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr cmd_vel_pub_;
+  rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr cmd_vel_stamped_pub_;
+  rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_pub_;
   rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr state_pub_;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr current_yaw_pub_;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr estimated_yaw_vel_pub_;
@@ -407,6 +424,7 @@ class InPlaceTurningExperimentNode : public rclcpp::Node {
   int64_t gyro_window_size_{0};
   double max_imu_delta_seconds_{0.0};
   bool invert_rotation_{false};
+  bool use_twist_stamped_{true};
   tf2::Vector3 up_in_imu_{0.0, 0.0, 1.0};
 
   std::deque<double> gyro_up_window_;

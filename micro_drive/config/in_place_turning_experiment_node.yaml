@@ -5,6 +5,7 @@ in_place_turning_experiment_node:
     angular_velocity_increment_rad: 0.1 # velocity increment added each successive run
     target_angular_velocity_rad: 2.0 # sweep stops once the next step would exceed this
     invert_rotation: false # true publishes the negative of the commanded velocity
+    use_twist_stamped: true # false publishes geometry_msgs/Twist instead of TwistStamped on /controller/cmd_vel
 
     # Experiment timing params
     min_run_time_seconds: 2.0 # time needed for the robot to reach the steady-state rotation

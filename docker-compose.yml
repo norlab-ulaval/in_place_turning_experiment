@@ -1,0 +1,20 @@
+services:
+  in_place_turning_experiment:
+    container_name: in_place_turning_experiment
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        USER_ID: ${UID:-1000}
+        GROUP_ID: ${GID:-1000}
+        USERNAME: robot
+    network_mode: host
+    ipc: host
+    environment:
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}
+    volumes:
+      - ./micro_drive/launch:/home/robot/ros2_ws/micro_drive/launch
+      - ./micro_drive/config:/home/robot/ros2_ws/micro_drive/config
+    stdin_open: true
+    tty: true
+    command: sleep infinity

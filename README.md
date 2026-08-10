@@ -10,26 +10,27 @@ velocity.
 
 ## Installation
 
-1. Clone the repo in a ROS 2 workspace
+Everything runs inside the Docker container defined by [Dockerfile](Dockerfile) and [docker-compose.yml](docker-compose.yml). Configs and launch files ([micro_drive/launch/](micro_drive/launch/) and [micro_drive/config/](micro_drive/config/)) are bind-mounted, so editing them on the host takes effect immediately without a rebuild. Any code change will require a docker rebuild.
+
+1. Clone the repo
 
 ```bash
-cd ~/ros2_ws/src
 git clone https://github.com/norlab-ulaval/in_place_turning_experiment.git
+cd in_place_turning_experiment
 ```
 
-2. Install rosdeps
+2. Build the image and start the container
 
 ```bash
-cd ~/ros2_ws
-rosdep install --from-paths src --ignore-src -r -y
+docker compose build
+docker compose up -d
 ```
 
-3. Build
+3. Open a shell in the container. ROS and the workspace overlay are sourced automatically.
 
 ```bash
-cd ~/ros2_ws
-colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release -Wno-dev --packages-select micro_drive
-source install/setup.bash
+docker compose exec in_place_turning_experiment bash
+ros2 topic list # Test communication with host
 ```
 
 ## Interfaces
@@ -40,9 +41,11 @@ Remap the in/out topics inside the launch file [micro_drive.launch.py](micro_dri
 | ----------------------- | ------------------------------ | --------- | ----------------------------------------------------- |
 | `/imu/data_raw`         | `sensor_msgs/Imu`              | in        | Raw IMU, feeds the gyro bias observer and compensator |
 | `/teleop/lock_autonomy` | `std_msgs/Bool`                | in        | `true` = deadman released → pause the experiment      |
-| `/controller/cmd_vel`   | `geometry_msgs/TwistStamped`   | out       | Angular velocity command sent to the robot            |
+| `/controller/cmd_vel`   | `geometry_msgs/TwistStamped`\* | out       | Angular velocity command sent to the robot            |
 | `/imu/bias`             | `geometry_msgs/Vector3Stamped` | internal  | Estimated gyro bias, published once                   |
 | `/imu/data_unbiased`    | `sensor_msgs/Imu`              | internal  | Bias-compensated IMU consumed by the experiment node  |
+
+\* `geometry_msgs/Twist` instead if `use_twist_stamped` is set to `false`.
 
 The experiment node also requires a valid tf between `imu_frame` and `base_frame`. So a robot_state_publisher must be publishing static TFs.
 
@@ -64,7 +67,7 @@ nothing until the bias arrives, so `/imu/data_unbiased` staying silent means the
 Parameters live in [in_place_turning_experiment_node.yaml](micro_drive/config/in_place_turning_experiment_node.yaml). You need to edit them so that the velocities and timing match what the robot can do.
 
 > ⚠️ **Warning: Low-level controller acceleration limits**
-> If the robot's low-level controller enforces acceleration limits, commanded accelerations must always stay within them. Exceeding these limits causes the controller to clamp or smooth commands.
+> If the robot's low-level controller enforces acceleration limits, commanded accelerations must always stay within them. Exceeding these limits will force the low-level controller to clamp or smooth commands.
 
 ### Velocity sweep
 
@@ -74,6 +77,7 @@ Parameters live in [in_place_turning_experiment_node.yaml](micro_drive/config/in
 | `angular_velocity_increment_rad` | `0.1`   | Increment added after each run, rad/s. Must be positive               |
 | `target_angular_velocity_rad`    | `2.0`   | Sweep stops once the next step would exceed this, rad/s               |
 | `invert_rotation`                | `false` | Publish the negative of the commanded velocity, to turn the other way |
+| `use_twist_stamped`              | `true`  | `false` publishes `geometry_msgs/Twist` instead of `TwistStamped` on `/controller/cmd_vel` |
 
 ### Timing
 
@@ -96,17 +100,19 @@ onto `base_link`'s z axis, so the IMU can be mounted in any orientation. **This 
 
 ## Running an experiment
 
-1. Place the robot in open space with room to rotate. It should be on hard flat terrain (Asphalt, concrete, tiles, etc.)
+1. Place the robot in open space with room to rotate. It should be on flat terrain.
 
-2. Launch a rosbag recording
+2. Launch a rosbag recording on the host
 
 ```bash
 ros2 bag record -a
 ```
 
-3. Launch the experiment and keep the robot **stationary**.
+3. Launch the experiment node inside the container and keep the robot **stationary**.
 
 ```bash
+docker compose up -d
+docker compose exec in_place_turning_experiment bash
 ros2 launch micro_drive micro_drive.launch.py
 ```
 
@@ -127,7 +133,7 @@ The call is rejected if the experiment is already running or if no IMU sample ha
 8. Watch the logs. Each run reports the rotation achieved and the velocity used; the node prints
    `Experiment complete.` when the sweep is done.
 
-9. Calling the service again restarts the whole sweep from `start_angular_velocity_rad`.
+9. Once the full sweep is done, calling the service again restarts the whole sweep from `start_angular_velocity_rad`.
 
 ```bash
 ros2 service call /in_place_turning_experiment_node/start_experiment std_srvs/srv/Trigger
