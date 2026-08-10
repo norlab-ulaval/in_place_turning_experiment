@@ -93,7 +93,7 @@ onto `base_link`'s z axis, so the IMU can be mounted in any orientation. **This 
 
 ## Running an experiment
 
-1. Place the robot in open space with room to rotate.
+1. Place the robot in open space with room to rotate. It should be on hard flat terrain (Asphalt, concrete, tiles, etc.)
 
 2. Launch a rosbag recording
 
