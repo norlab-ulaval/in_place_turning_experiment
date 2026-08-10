@@ -147,4 +147,4 @@ The call is rejected if the experiment is already running or if no IMU sample ha
 ros2 service call /in_place_turning_experiment_node/start_experiment std_srvs/srv/Trigger
 ```
 
-10. You can stop after 3-5 sweeps. With the current default values 5 sweeps takes about `38.75` minutes
+10. You can stop after around 5 sweeps. With the current default values 5 sweeps takes about `38.75` minutes
