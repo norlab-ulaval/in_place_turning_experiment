@@ -39,11 +39,11 @@ class InPlaceTurningExperimentNode : public rclcpp::Node {
  public:
   InPlaceTurningExperimentNode() : Node("in_place_turning_experiment_node") {
     // Declare params
-    declare_parameter("start_angular_velocity_rad", 0.6);
-    declare_parameter("angular_velocity_increment_rad", 0.1);
-    declare_parameter("target_angular_velocity_rad", 3.0);
+    declare_parameter("start_angular_velocity_rad", 0.05);
+    declare_parameter("angular_velocity_increment_rad", 0.02);
+    declare_parameter("target_angular_velocity_rad", 1.6);
     declare_parameter("min_run_time_seconds", 2.0);
-    declare_parameter("wait_time_seconds", 3.0);
+    declare_parameter("wait_time_seconds", 4.0);
     declare_parameter("publish_frequency_hz", 20.0);
     declare_parameter("command_delay_seconds", 0.25);
     declare_parameter<std::string>("stopping_model", "baseline");

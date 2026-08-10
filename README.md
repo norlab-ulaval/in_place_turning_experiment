@@ -45,7 +45,7 @@ Remap the in/out topics inside the launch file [micro_drive.launch.py](micro_dri
 | `/imu/bias`             | `geometry_msgs/Vector3Stamped` | internal  | Estimated gyro bias, published once                   |
 | `/imu/data_unbiased`    | `sensor_msgs/Imu`              | internal  | Bias-compensated IMU consumed by the experiment node  |
 
-\* `geometry_msgs/Twist` instead if `use_twist_stamped` is set to `false`.
+\* `geometry_msgs/Twist` instead if the parameter `use_twist_stamped` is set to `false`.
 
 The experiment node also requires a valid tf between `imu_frame` and `base_frame`. So a robot_state_publisher must be publishing static TFs.
 
@@ -73,9 +73,9 @@ Parameters live in [in_place_turning_experiment_node.yaml](micro_drive/config/in
 
 | Parameter                        | Default | Description                                                           |
 | -------------------------------- | ------- | --------------------------------------------------------------------- |
-| `start_angular_velocity_rad`     | `0.6`   | Angular velocity of the first run, rad/s. Must be positive            |
-| `angular_velocity_increment_rad` | `0.1`   | Increment added after each run, rad/s. Must be positive               |
-| `target_angular_velocity_rad`    | `2.0`   | Sweep stops once the next step would exceed this, rad/s               |
+| `start_angular_velocity_rad`     | `0.05`  | Angular velocity of the first run, rad/s. Must be positive            |
+| `angular_velocity_increment_rad` | `0.02`  | Increment added after each run, rad/s. Must be positive               |
+| `target_angular_velocity_rad`    | `1.6`   | Sweep stops once the next step would exceed this, rad/s               |
 | `invert_rotation`                | `false` | Publish the negative of the commanded velocity, to turn the other way |
 | `use_twist_stamped`              | `true`  | `false` publishes `geometry_msgs/Twist` instead of `TwistStamped` on `/controller/cmd_vel` |
 
@@ -84,8 +84,16 @@ Parameters live in [in_place_turning_experiment_node.yaml](micro_drive/config/in
 | Parameter              | Default | Description                                                                                                                                                                        |
 | ---------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `min_run_time_seconds` | `2.0`   | Time the robot needs to reach steady-state rotation. Sets the run's target angle with `angular_velocity * min_run_time_seconds`, so every run spends roughly the same time turning |
-| `wait_time_seconds`    | `2.5`   | Pause after the command is cut. The robot should not be wiggling after that time. Better to make it longer than shorter                                                            |
+| `wait_time_seconds`    | `4.0`   | Pause after the command is cut. The robot should not be wiggling after that time. Better to make it longer than shorter                                                            |
 | `publish_frequency_hz` | `20.0`  | Rate of the `/controller/cmd_vel` and `~/state` publishers                                                                                                                         |
+
+After changing the timing parameters, you can approximate the full sweep duration in seconds with:
+
+$$
+t_{\text{sweep}} \approx \frac{\text{target\_angular\_velocity\_rad} - \text{start\_angular\_velocity\_rad}}{\text{angular\_velocity\_increment\_rad}} \times (\text{min\_run\_time\_seconds} + \text{wait\_time\_seconds})
+$$
+
+With the current default values, it is around `465` seconds (`7.75` minutes) 
 
 ### IMU
 
