@@ -2,6 +2,11 @@
 
 Records the transient motion of a skid-steering robot turning in place.
 
+
+## Motivation
+
+When a skid-steering robot is commanded to stop rotating in place, it doesn't stop instantly. As the tires deform and release, the yaw rate overshoots and rings for a fraction of a second before settling. This experiment collects data to see whether this "stop transient" trend holds across platforms of different weight and tire types. The resulting IMU and lidar data are used offline to fit and validate the motion model.
+
 `in_place_turning_experiment_node` integrates the IMU gyroscope to track the robot's heading, then runs a
 sweep of _runs_. One run = command a constant angular velocity until the robot has rotated a target angle,
 then cut the command to zero and wait while the robot coasts and settles. The angular velocity is then
