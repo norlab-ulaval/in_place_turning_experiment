@@ -34,7 +34,7 @@ source install/setup.bash
 
 ## Interfaces
 
-Remap the in/out topics inside the launch file `launch/micro_drive.launch.py`. (Internal topics can stay as is)
+Remap the in/out topics inside the launch file [micro_drive.launch.py](micro_drive/launch/micro_drive.launch.py). (Internal topics can stay as is)
 
 | Topic                   | Type                           | Direction | Description                                           |
 | ----------------------- | ------------------------------ | --------- | ----------------------------------------------------- |
@@ -61,7 +61,7 @@ nothing until the bias arrives, so `/imu/data_unbiased` staying silent means the
 
 ## Configuration
 
-Parameters live in `config/in_place_turning_experiment_node.yaml`. You need to edit them so that the velocities and timing match what the robot can do.
+Parameters live in [in_place_turning_experiment_node.yaml](micro_drive/config/in_place_turning_experiment_node.yaml). You need to edit them so that the velocities and timing match what the robot can do.
 
 ### Velocity sweep
 
