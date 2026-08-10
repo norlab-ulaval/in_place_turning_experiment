@@ -90,7 +90,7 @@ Parameters live in [in_place_turning_experiment_node.yaml](micro_drive/config/in
 After changing the timing parameters, you can approximate the full sweep duration in seconds with:
 
 $$
-t_{\text{sweep}} \approx \frac{\text{target\_angular\_velocity\_rad} - \text{start\_angular\_velocity\_rad}}{\text{angular\_velocity\_increment\_rad}} \times (\text{min\_run\_time\_seconds} + \text{wait\_time\_seconds})
+t_{\text{sweep}} \approx \frac{\text{target\\_angular\\_velocity\\_rad} - \text{start\\_angular\\_velocity\\_rad}}{\text{angular\\_velocity\\_increment\\_rad}} \times (\text{min\\_run\\_time\\_seconds} + \text{wait\\_time\\_seconds})
 $$
 
 With the current default values, it is around `465` seconds (`7.75` minutes) 
