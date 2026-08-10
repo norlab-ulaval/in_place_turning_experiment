@@ -48,7 +48,7 @@ The experiment node also requires a valid tf between `imu_frame` and `base_frame
 
 ## IMU Bias Observer/Compensator
 
-Gyroscope integration also accumulates the gyro's bias, so the bias has to be removed before the experiment starts. Two nodes launched
+Gyroscope integration accumulates the gyro's bias, so the bias has to be removed before the experiment starts. Two nodes launched
 alongside the experiment node will take care of it.
 
 `imu_bias_observer` averages the first 4000 samples of `/imu/data_raw` (~20 s at 200 Hz, ~40 s at 100 Hz) and
@@ -57,11 +57,14 @@ observation**, otherwise the motion is baked into the bias estimate.
 
 `imu_bias_compensator_node` subscribes to `/imu/bias` and `/imu/data_raw`, subtracts the bias from the angular
 velocity and republishes on `/imu/data_unbiased`, which is what the experiment node consumes. It publishes
-nothing until the bias arrives, so `/imu/data_unbiased` staying silent means the observation is not finished.
+nothing until the bias arrives, so `/imu/data_unbiased` staying silent means the observation is not finished. 
 
 ## Configuration
 
 Parameters live in [in_place_turning_experiment_node.yaml](micro_drive/config/in_place_turning_experiment_node.yaml). You need to edit them so that the velocities and timing match what the robot can do.
+
+> ⚠️ **Warning: Low-level controller acceleration limits**
+> If the robot's low-level controller enforces acceleration limits, commanded accelerations must always stay within them. Exceeding these limits causes the controller to clamp or smooth commands.
 
 ### Velocity sweep
 
