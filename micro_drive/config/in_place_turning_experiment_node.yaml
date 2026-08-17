@@ -1,15 +1,15 @@
 in_place_turning_experiment_node:
   ros__parameters:
     # Velocity params
-    start_angular_velocity_rad: 0.05 # angular velocity of the first run in the sweep
-    angular_velocity_increment_rad: 0.02 # velocity increment added each successive run
-    target_angular_velocity_rad: 1.6 # sweep stops once the next step would exceed this
-    invert_rotation: false # true publishes the negative of the commanded velocity
+    start_angular_velocity_rad: 0.6 # angular velocity of the first run in the sweep
+    angular_velocity_increment_rad: 0.05 # velocity increment added each successive run
+    target_angular_velocity_rad: 1.5 # sweep stops once the next step would exceed this
+    invert_rotation: true # true publishes the negative of the commanded velocity
     use_twist_stamped: true # false publishes geometry_msgs/Twist instead of TwistStamped on /controller/cmd_vel
 
     # Experiment timing params
     min_run_time_seconds: 2.0 # time needed for the robot to reach the steady-state rotation
-    wait_time_seconds: 4.0 # pause after each run to observe the recoil transient
+    wait_time_seconds: 2.0 # pause after each run to observe the recoil transient
     publish_frequency_hz: 20.0 # rate of the /controller/cmd_vel and ~/state publishers
 
     # IMU params
@@ -17,3 +17,18 @@ in_place_turning_experiment_node:
     base_frame: "base_link" # robot body frame, used to find the "up" axis via tf
     gyro_window_size: 20 # number of IMU samples averaged for the yaw-rate estimate
     max_imu_delta_seconds: 0.1 # max IMU-to-IMU dt accepted before a sample is discarded
+
+    # Model params
+    stopping_model: "deadtime" # "baseline", "deadtime" or "dahl" run-stopping prediction model
+
+    # Deadtime model (the dahl model uses command_delay_seconds too, as its output shift)
+    command_delay_seconds: 0.1 # actuation delay compensated for by the deadtime model
+
+    # Dahl model
+    dahl_omega_n: 21.6647 # sqrt(sigma_0/J), bristle stiffness as a stick-regime frequency (rad/s)
+    dahl_zeta_b: 0.0265 # sigma_1/(2*omega_n*J), bristle micro-damping as a damping ratio
+    dahl_a_c: 6.0965 # tau_c/J, Coulomb level the sliding tire saturates against (rad/s^2)
+    dahl_alpha: 1.0881 # exponent shaping the bristle's stress-strain curve
+    dahl_s2: 4.0646 # sigma_2/J, viscous coefficient (1/s)
+    dahl_horizon_seconds: 1.2 # rollout length; matches the fit window, transient is dead by ~0.6 s
+    dahl_integration_rate_hz: 400.0 # RK4 output rate of the rollout, substepped when needed
