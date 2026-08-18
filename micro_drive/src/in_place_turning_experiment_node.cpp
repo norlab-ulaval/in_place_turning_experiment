@@ -5,11 +5,11 @@
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <deque>
 #include <geometry_msgs/msg/transform_stamped.hpp>
-#include <geometry_msgs/msg/twist.hpp>
 #include <geometry_msgs/msg/twist_stamped.hpp>
 #include <iomanip>
 #include <rclcpp/rclcpp.hpp>
@@ -23,6 +23,13 @@
 #include <stdexcept>
 
 using namespace std::chrono_literals;
+
+// An internal RK4 substep is taken whenever the bristle relaxation rate times the output step
+// would exceed this. 0.5 is comfortably inside RK4's ~2.78 stability limit. Mirrors
+// SUBSTEP_SAFETY / MAX_SUBSTEPS in preprocess/fitting_dahl.py, which the parameters come from.
+constexpr double kDahlSubstepSafety = 0.5;
+// Cap on the substepping, so a bad parameter set cannot stall the IMU callback.
+constexpr int kDahlMaxSubsteps = 64;
 
 enum class State { IDLE, ROTATING, WAITING, DONE, LOCKED };
 // IDLE: waiting for a start_experiment call, commanding zero velocity.
@@ -39,20 +46,30 @@ class InPlaceTurningExperimentNode : public rclcpp::Node {
  public:
   InPlaceTurningExperimentNode() : Node("in_place_turning_experiment_node") {
     // Declare params
-    declare_parameter("start_angular_velocity_rad", 0.05);
-    declare_parameter("angular_velocity_increment_rad", 0.02);
-    declare_parameter("target_angular_velocity_rad", 1.6);
+    declare_parameter("start_angular_velocity_rad", 0.6);
+    declare_parameter("angular_velocity_increment_rad", 0.1);
+    declare_parameter("target_angular_velocity_rad", 3.0);
     declare_parameter("min_run_time_seconds", 2.0);
-    declare_parameter("wait_time_seconds", 4.0);
+    declare_parameter("wait_time_seconds", 3.0);
     declare_parameter("publish_frequency_hz", 20.0);
     declare_parameter("command_delay_seconds", 0.25);
-    declare_parameter<std::string>("stopping_model", "baseline");
+    declare_parameter<std::string>("stopping_model", "deadtime");
+    // Dahl friction model, normalized by the yaw inertia J: only sigma_0/J, sigma_1/J,
+    // sigma_2/J and tau_c/J are identifiable, so J never appears here. Defaults are the pooled
+    // fit of the warthog front_workshop_35kpa dataset (dahl_fit.json, 107 steps, 9.1% relative
+    // RMS), produced by preprocess/fitting_dahl.py.
+    declare_parameter("dahl_omega_n", 21.6647);
+    declare_parameter("dahl_zeta_b", 0.0265);
+    declare_parameter("dahl_a_c", 6.0965);
+    declare_parameter("dahl_alpha", 1.0881);
+    declare_parameter("dahl_s2", 4.0646);
+    declare_parameter("dahl_horizon_seconds", 1.2);
+    declare_parameter("dahl_integration_rate_hz", 400.0);
     declare_parameter<std::string>("imu_frame", "imu_link");
     declare_parameter<std::string>("base_frame", "base_link");
     declare_parameter("gyro_window_size", 20);
     declare_parameter("max_imu_delta_seconds", 0.1);
     declare_parameter("invert_rotation", false);
-    declare_parameter("use_twist_stamped", true);
 
     // Getting params
     start_angular_velocity_rad_ = get_parameter("start_angular_velocity_rad").as_double();
@@ -63,17 +80,23 @@ class InPlaceTurningExperimentNode : public rclcpp::Node {
     publish_frequency_hz_ = get_parameter("publish_frequency_hz").as_double();
     command_delay_seconds_ = get_parameter("command_delay_seconds").as_double();
     stopping_model_ = get_parameter("stopping_model").as_string();
+    dahl_omega_n_ = get_parameter("dahl_omega_n").as_double();
+    dahl_zeta_b_ = get_parameter("dahl_zeta_b").as_double();
+    dahl_a_c_ = get_parameter("dahl_a_c").as_double();
+    dahl_alpha_ = get_parameter("dahl_alpha").as_double();
+    dahl_s2_ = get_parameter("dahl_s2").as_double();
+    dahl_horizon_seconds_ = get_parameter("dahl_horizon_seconds").as_double();
+    dahl_integration_rate_hz_ = get_parameter("dahl_integration_rate_hz").as_double();
     imu_frame_ = get_parameter("imu_frame").as_string();
     base_frame_ = get_parameter("base_frame").as_string();
     gyro_window_size_ = get_parameter("gyro_window_size").as_int();
     max_imu_delta_seconds_ = get_parameter("max_imu_delta_seconds").as_double();
     invert_rotation_ = get_parameter("invert_rotation").as_bool();
-    use_twist_stamped_ = get_parameter("use_twist_stamped").as_bool();
 
     // Validation
-    if (stopping_model_ != "baseline" && stopping_model_ != "deadtime") {
+    if (stopping_model_ != "baseline" && stopping_model_ != "deadtime" && stopping_model_ != "dahl") {
       throw std::runtime_error("Unknown or unimplemented stopping_model '" + stopping_model_ +
-                               "'. Valid options: baseline, deadtime.");
+                               "'. Valid options: baseline, deadtime, dahl.");
     }
     if (wait_time_seconds_ < 0.0) {
       throw std::runtime_error("wait_time_seconds must be non-negative, got " + std::to_string(wait_time_seconds_) +
@@ -119,6 +142,32 @@ class InPlaceTurningExperimentNode : public rclcpp::Node {
       throw std::runtime_error("min_run_time_seconds must be positive, got " + std::to_string(min_run_time_seconds_) +
                                ".");
     }
+    // Checked whatever the stopping model is: the defaults are valid, so a bad value here is a
+    // typo in the config rather than an unused parameter.
+    if (dahl_omega_n_ <= 0.0) {
+      throw std::runtime_error("dahl_omega_n must be positive, got " + std::to_string(dahl_omega_n_) + ".");
+    }
+    if (dahl_zeta_b_ < 0.0) {
+      throw std::runtime_error("dahl_zeta_b must be non-negative, got " + std::to_string(dahl_zeta_b_) + ".");
+    }
+    if (dahl_a_c_ <= 0.0) {
+      throw std::runtime_error("dahl_a_c is the Coulomb level the bristle saturates against and must be positive, got " +
+                               std::to_string(dahl_a_c_) + ".");
+    }
+    if (dahl_alpha_ <= 0.0) {
+      throw std::runtime_error("dahl_alpha must be positive, got " + std::to_string(dahl_alpha_) + ".");
+    }
+    if (dahl_s2_ < 0.0) {
+      throw std::runtime_error("dahl_s2 must be non-negative, got " + std::to_string(dahl_s2_) + ".");
+    }
+    if (dahl_horizon_seconds_ <= 0.0) {
+      throw std::runtime_error("dahl_horizon_seconds must be positive, got " + std::to_string(dahl_horizon_seconds_) +
+                               ".");
+    }
+    if (dahl_integration_rate_hz_ <= 0.0) {
+      throw std::runtime_error("dahl_integration_rate_hz must be positive, got " +
+                               std::to_string(dahl_integration_rate_hz_) + ".");
+    }
 
     // Imu init
     init_up_axis(imu_frame_, base_frame_);
@@ -132,11 +181,7 @@ class InPlaceTurningExperimentNode : public rclcpp::Node {
         std::bind(&InPlaceTurningExperimentNode::lock_callback, this, std::placeholders::_1));
 
     // Publishers
-    if (use_twist_stamped_) {
-      cmd_vel_stamped_pub_ = create_publisher<geometry_msgs::msg::TwistStamped>("/controller/cmd_vel", 10);
-    } else {
-      cmd_vel_pub_ = create_publisher<geometry_msgs::msg::Twist>("/controller/cmd_vel", 10);
-    }
+    cmd_vel_pub_ = create_publisher<geometry_msgs::msg::TwistStamped>("/controller/cmd_vel", 10);
     state_pub_ = create_publisher<std_msgs::msg::Int32>("~/state", 10);
     current_yaw_pub_ = create_publisher<std_msgs::msg::Float64>("~/current_yaw", 200);
     estimated_yaw_vel_pub_ = create_publisher<std_msgs::msg::Float64>("~/estimated_yaw_vel", 200);
@@ -243,31 +288,29 @@ class InPlaceTurningExperimentNode : public rclcpp::Node {
          << "\"publish_frequency_hz\":" << publish_frequency_hz_ << ","
          << "\"command_delay_seconds\":" << command_delay_seconds_ << ","
          << "\"stopping_model\":\"" << stopping_model_ << "\","
+         << "\"dahl_omega_n\":" << dahl_omega_n_ << ","
+         << "\"dahl_zeta_b\":" << dahl_zeta_b_ << ","
+         << "\"dahl_a_c\":" << dahl_a_c_ << ","
+         << "\"dahl_alpha\":" << dahl_alpha_ << ","
+         << "\"dahl_s2\":" << dahl_s2_ << ","
+         << "\"dahl_horizon_seconds\":" << dahl_horizon_seconds_ << ","
+         << "\"dahl_integration_rate_hz\":" << dahl_integration_rate_hz_ << ","
          << "\"imu_frame\":\"" << imu_frame_ << "\","
          << "\"base_frame\":\"" << base_frame_ << "\","
          << "\"gyro_window_size\":" << gyro_window_size_ << ","
          << "\"max_imu_delta_seconds\":" << max_imu_delta_seconds_ << ","
-         << "\"invert_rotation\":" << (invert_rotation_ ? "true" : "false") << ","
-         << "\"use_twist_stamped\":" << (use_twist_stamped_ ? "true" : "false") << "}";
+         << "\"invert_rotation\":" << (invert_rotation_ ? "true" : "false") << "}";
     return json.str();
   }
 
   // Publishes the current commanded velocity and state at a fixed rate.
   // Zero velocity is published when not rotating, keeping the controller fed.
   void timer_callback() {
-    const double angular_z = invert_rotation_ ? -commanded_velocity_ : commanded_velocity_;
-
-    if (use_twist_stamped_) {
-      geometry_msgs::msg::TwistStamped cmd_msg;
-      cmd_msg.header.stamp = now();
-      cmd_msg.header.frame_id = base_frame_;
-      cmd_msg.twist.angular.z = angular_z;
-      cmd_vel_stamped_pub_->publish(cmd_msg);
-    } else {
-      geometry_msgs::msg::Twist cmd_msg;
-      cmd_msg.angular.z = angular_z;
-      cmd_vel_pub_->publish(cmd_msg);
-    }
+    geometry_msgs::msg::TwistStamped cmd_msg;
+    cmd_msg.header.stamp = now();
+    cmd_msg.header.frame_id = base_frame_;
+    cmd_msg.twist.angular.z = invert_rotation_ ? -commanded_velocity_ : commanded_velocity_;
+    cmd_vel_pub_->publish(cmd_msg);
 
     std_msgs::msg::Int32 state_msg;
     state_msg.data = static_cast<int>(state_);
@@ -338,14 +381,80 @@ class InPlaceTurningExperimentNode : public rclcpp::Node {
     estimated_yaw_vel_pub_->publish(f);
   }
 
+  // One state of the Dahl rollout, and its derivative: the tires' bristle deflection z, the
+  // body's yaw rate w, and the yaw accumulated since the command was released.
+  struct DahlState {
+    double z;
+    double w;
+    double yaw;
+  };
+
+  static double sign(double value) { return static_cast<double>(value > 0.0) - static_cast<double>(value < 0.0); }
+
+  static DahlState advance(const DahlState& s, const DahlState& d, double h) {
+    return {s.z + h * d.z, s.w + h * d.w, s.yaw + h * d.yaw};
+  }
+
+  // The Dahl friction model of preprocess/fitting_dahl.py, in torsional form and already
+  // divided through by the yaw inertia J:
+  //
+  //   b       = 1 - (sigma_0*z/tau_c)*sign(w)
+  //   dz/dt   = sign(b)*|b|^alpha * w
+  //   dw/dt   = -( sigma_0*z + sigma_1*dz/dt + sigma_2*w ) / J
+  //
+  // The equations are odd in (z, w), so feeding a signed yaw rate in gives a signed yaw out and
+  // no separate sign bookkeeping is needed here.
+  DahlState dahl_derivative(const DahlState& s) const {
+    const double k_over_j = dahl_omega_n_ * dahl_omega_n_;
+    const double c_over_j = 2.0 * dahl_zeta_b_ * dahl_omega_n_;
+    const double b = 1.0 - (k_over_j * s.z / dahl_a_c_) * sign(s.w);
+    const double dz = sign(b) * std::pow(std::abs(b), dahl_alpha_) * s.w;
+    return {dz, -(k_over_j * s.z + c_over_j * dz + dahl_s2_ * s.w), s.w};
+  }
+
+  // Yaw still to come if the command is released now, at the current estimated yaw rate.
+  //
+  // The deadtime is a pure output shift in the fit, so the body holds its rate for
+  // command_delay_seconds_ and only then starts the transient — the deadtime model's whole
+  // prediction is this function's initial condition. What Dahl adds is the transient itself:
+  // the robot slides to a stop against the Coulomb level, then the loaded bristle springs it
+  // back, and the recoil returns roughly a third of the yaw the slide gave away. The integral
+  // is therefore signed and lands well short of the peak overshoot.
+  double dahl_predicted_coast(double w0) const {
+    DahlState state{0.0, w0, w0 * command_delay_seconds_};
+
+    const double dt_out = 1.0 / dahl_integration_rate_hz_;
+    // The bristle relaxes at sigma_0*|w|/tau_c, fastest at the release rate since the motion
+    // only decays from there. At the fitted parameters this is ~115 1/s and n_sub stays 1; the
+    // substepping is here so an untuned parameter set degrades in accuracy, not stability.
+    const double relaxation_rate = dahl_omega_n_ * dahl_omega_n_ * std::abs(w0) / dahl_a_c_;
+    const int n_sub = std::clamp(static_cast<int>(std::ceil(relaxation_rate * dt_out / kDahlSubstepSafety)), 1,
+                                 kDahlMaxSubsteps);
+    const double dt = dt_out / n_sub;
+    const long n_steps = std::lround(std::ceil(dahl_horizon_seconds_ * dahl_integration_rate_hz_)) * n_sub;
+
+    for (long i = 0; i < n_steps; ++i) {
+      const DahlState k1 = dahl_derivative(state);
+      const DahlState k2 = dahl_derivative(advance(state, k1, 0.5 * dt));
+      const DahlState k3 = dahl_derivative(advance(state, k2, 0.5 * dt));
+      const DahlState k4 = dahl_derivative(advance(state, k3, dt));
+      state = {state.z + (dt / 6.0) * (k1.z + 2.0 * k2.z + 2.0 * k3.z + k4.z),
+               state.w + (dt / 6.0) * (k1.w + 2.0 * k2.w + 2.0 * k3.w + k4.w),
+               state.yaw + (dt / 6.0) * (k1.yaw + 2.0 * k2.yaw + 2.0 * k3.yaw + k4.yaw)};
+    }
+    return state.yaw;
+  }
+
   void handle_rotating() {
     const double rotation = unwrapped_yaw_;
 
-    double predicted_rotation;
+    double predicted_rotation = rotation;
     if (stopping_model_ == "baseline") {
       predicted_rotation = rotation;
     } else if (stopping_model_ == "deadtime") {
       predicted_rotation = rotation + estimated_angular_velocity_ * command_delay_seconds_;
+    } else if (stopping_model_ == "dahl") {
+      predicted_rotation = rotation + dahl_predicted_coast(estimated_angular_velocity_);
     }
 
     if (std::abs(predicted_rotation) < current_run_target_rotation_rad_) {
@@ -391,8 +500,7 @@ class InPlaceTurningExperimentNode : public rclcpp::Node {
 
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr lock_sub_;
-  rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr cmd_vel_stamped_pub_;
-  rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_pub_;
+  rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr cmd_vel_pub_;
   rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr state_pub_;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr current_yaw_pub_;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr estimated_yaw_vel_pub_;
@@ -419,12 +527,18 @@ class InPlaceTurningExperimentNode : public rclcpp::Node {
   double publish_frequency_hz_{0.0};
   double command_delay_seconds_{0.0};
   std::string stopping_model_;
+  double dahl_omega_n_{0.0};
+  double dahl_zeta_b_{0.0};
+  double dahl_a_c_{0.0};
+  double dahl_alpha_{0.0};
+  double dahl_s2_{0.0};
+  double dahl_horizon_seconds_{0.0};
+  double dahl_integration_rate_hz_{0.0};
   std::string imu_frame_;
   std::string base_frame_;
   int64_t gyro_window_size_{0};
   double max_imu_delta_seconds_{0.0};
   bool invert_rotation_{false};
-  bool use_twist_stamped_{true};
   tf2::Vector3 up_in_imu_{0.0, 0.0, 1.0};
 
   std::deque<double> gyro_up_window_;

@@ -8,8 +8,8 @@ in_place_turning_experiment_node:
     use_twist_stamped: true # false publishes geometry_msgs/Twist instead of TwistStamped on /controller/cmd_vel
 
     # Experiment timing params
-    min_run_time_seconds: 2.0 # time needed for the robot to reach the steady-state rotation
-    wait_time_seconds: 2.0 # pause after each run to observe the recoil transient
+    min_run_time_seconds: 3.0 # time needed for the robot to reach the steady-state rotation
+    wait_time_seconds: 3.0 # pause after each run to observe the recoil transient
     publish_frequency_hz: 20.0 # rate of the /controller/cmd_vel and ~/state publishers
 
     # IMU params
@@ -19,7 +19,7 @@ in_place_turning_experiment_node:
     max_imu_delta_seconds: 0.1 # max IMU-to-IMU dt accepted before a sample is discarded
 
     # Model params
-    stopping_model: "deadtime" # "baseline", "deadtime" or "dahl" run-stopping prediction model
+    stopping_model: "dahl" # "baseline", "deadtime" or "dahl" run-stopping prediction model
 
     # Deadtime model (the dahl model uses command_delay_seconds too, as its output shift)
     command_delay_seconds: 0.1 # actuation delay compensated for by the deadtime model
