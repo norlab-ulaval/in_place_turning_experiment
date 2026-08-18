@@ -13,7 +13,7 @@ in_place_turning_experiment_node:
     publish_frequency_hz: 20.0 # rate of the /controller/cmd_vel and ~/state publishers
 
     # IMU params
-    imu_frame: "imu_link" # IMU frame, used to find the "up" axis via tf
+    imu_frame: "vn100_link" # IMU frame, used to find the "up" axis via tf
     base_frame: "base_link" # robot body frame, used to find the "up" axis via tf
     gyro_window_size: 20 # number of IMU samples averaged for the yaw-rate estimate
     max_imu_delta_seconds: 0.1 # max IMU-to-IMU dt accepted before a sample is discarded
