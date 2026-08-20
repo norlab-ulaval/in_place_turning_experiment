@@ -66,6 +66,11 @@ class InPlaceTurningExperimentNode : public rclcpp::Node {
     declare_parameter("dahl_s2", 4.0646);
     declare_parameter("dahl_horizon_seconds", 1.2);
     declare_parameter("dahl_integration_rate_hz", 400.0);
+    // Rabiee & Biswas (ICRA 2019) friction-based model. In an in-place turn both of its force
+    // laws go rate-independent (see preprocess/fitting_rabiee.py), so the whole model collapses
+    // to one constant deceleration a_R = tau_R/J. Default is the pooled fit of the warthog
+    // front_workshop_35kpa dataset (rabiee_fit.json, 107 steps, 11.3% relative RMS).
+    declare_parameter("rabiee_a_r", 7.8900);
     declare_parameter<std::string>("imu_frame", "imu_link");
     declare_parameter<std::string>("base_frame", "base_link");
     declare_parameter("gyro_window_size", 20);
@@ -89,6 +94,7 @@ class InPlaceTurningExperimentNode : public rclcpp::Node {
     dahl_s2_ = get_parameter("dahl_s2").as_double();
     dahl_horizon_seconds_ = get_parameter("dahl_horizon_seconds").as_double();
     dahl_integration_rate_hz_ = get_parameter("dahl_integration_rate_hz").as_double();
+    rabiee_a_r_ = get_parameter("rabiee_a_r").as_double();
     imu_frame_ = get_parameter("imu_frame").as_string();
     base_frame_ = get_parameter("base_frame").as_string();
     gyro_window_size_ = get_parameter("gyro_window_size").as_int();
@@ -97,9 +103,10 @@ class InPlaceTurningExperimentNode : public rclcpp::Node {
     use_twist_stamped_ = get_parameter("use_twist_stamped").as_bool();
 
     // Validation
-    if (stopping_model_ != "baseline" && stopping_model_ != "deadtime" && stopping_model_ != "dahl") {
+    if (stopping_model_ != "baseline" && stopping_model_ != "deadtime" && stopping_model_ != "dahl" &&
+        stopping_model_ != "rabiee") {
       throw std::runtime_error("Unknown or unimplemented stopping_model '" + stopping_model_ +
-                               "'. Valid options: baseline, deadtime, dahl.");
+                               "'. Valid options: baseline, deadtime, dahl, rabiee.");
     }
     if (wait_time_seconds_ < 0.0) {
       throw std::runtime_error("wait_time_seconds must be non-negative, got " + std::to_string(wait_time_seconds_) +
@@ -170,6 +177,10 @@ class InPlaceTurningExperimentNode : public rclcpp::Node {
     if (dahl_integration_rate_hz_ <= 0.0) {
       throw std::runtime_error("dahl_integration_rate_hz must be positive, got " +
                                std::to_string(dahl_integration_rate_hz_) + ".");
+    }
+    if (rabiee_a_r_ <= 0.0) {
+      throw std::runtime_error("rabiee_a_r is a deceleration magnitude and must be positive, got " +
+                               std::to_string(rabiee_a_r_) + ".");
     }
 
     // Imu init
@@ -302,6 +313,7 @@ class InPlaceTurningExperimentNode : public rclcpp::Node {
          << "\"dahl_s2\":" << dahl_s2_ << ","
          << "\"dahl_horizon_seconds\":" << dahl_horizon_seconds_ << ","
          << "\"dahl_integration_rate_hz\":" << dahl_integration_rate_hz_ << ","
+         << "\"rabiee_a_r\":" << rabiee_a_r_ << ","
          << "\"imu_frame\":\"" << imu_frame_ << "\","
          << "\"base_frame\":\"" << base_frame_ << "\","
          << "\"gyro_window_size\":" << gyro_window_size_ << ","
@@ -461,6 +473,17 @@ class InPlaceTurningExperimentNode : public rclcpp::Node {
     return state.yaw;
   }
 
+  // Same question as dahl_predicted_coast, answered by the Rabiee & Biswas friction-based
+  // model as published. In an in-place turn the slip angle is pinned at arctan(a/b) and the
+  // slip ratio is singular at zero commanded wheel velocity, so both of the paper's force laws
+  // saturate and the model collapses exactly to a constant deceleration a_R held after the
+  // deadtime (preprocess/fitting_rabiee.py derives this). Closed form: the rate holds w0
+  // through the deadtime, then sweeps half the plateau rectangle and stops dead — no recoil is
+  // represented, so this model gives the yaw back at the zero crossing and nothing after.
+  double rabiee_predicted_coast(double w0) const {
+    return w0 * command_delay_seconds_ + sign(w0) * w0 * w0 / (2.0 * rabiee_a_r_);
+  }
+
   void handle_rotating() {
     const double rotation = unwrapped_yaw_;
 
@@ -471,6 +494,8 @@ class InPlaceTurningExperimentNode : public rclcpp::Node {
       predicted_rotation = rotation + estimated_angular_velocity_ * command_delay_seconds_;
     } else if (stopping_model_ == "dahl") {
       predicted_rotation = rotation + dahl_predicted_coast(estimated_angular_velocity_);
+    } else if (stopping_model_ == "rabiee") {
+      predicted_rotation = rotation + rabiee_predicted_coast(estimated_angular_velocity_);
     }
 
     if (std::abs(predicted_rotation) < current_run_target_rotation_rad_) {
@@ -551,6 +576,7 @@ class InPlaceTurningExperimentNode : public rclcpp::Node {
   double dahl_s2_{0.0};
   double dahl_horizon_seconds_{0.0};
   double dahl_integration_rate_hz_{0.0};
+  double rabiee_a_r_{0.0};
   std::string imu_frame_;
   std::string base_frame_;
   int64_t gyro_window_size_{0};
