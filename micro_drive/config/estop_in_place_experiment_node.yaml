@@ -1,0 +1,19 @@
+estop_in_place_experiment_node:
+  ros__parameters:
+    # Velocity params
+    start_angular_velocity_rad: 0.6 # angular velocity of the first run in the sweep
+    angular_velocity_increment_rad: 0.05 # velocity increment added on each e-stop press
+    target_angular_velocity_rad: 1.5 # sweep stops once the next step would exceed this
+    invert_rotation: true # true publishes the negative of the commanded velocity
+
+    # Experiment timing params
+    publish_frequency_hz: 20.0 # rate of the /controller/cmd_vel and ~/state publishers
+
+    # E-stop params
+    invert_estop: false # false means true on /estop == e-stop engaged
+
+    # IMU params
+    imu_frame: "vn100_link" # IMU frame, used to find the "up" axis via tf
+    base_frame: "base_link" # robot body frame, used to find the "up" axis via tf
+    gyro_window_size: 20 # number of IMU samples averaged for the yaw-rate estimate
+    max_imu_delta_seconds: 0.1 # max IMU-to-IMU dt accepted before a sample is discarded

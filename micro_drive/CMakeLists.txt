@@ -42,6 +42,10 @@ ament_target_dependencies(imu_bias_compensator_node
         )
 target_link_libraries(imu_bias_compensator_node "${cpp_typesupport_target}")
 
+add_executable(estop_in_place_experiment_node src/estop_in_place_experiment_node.cpp)
+ament_target_dependencies(estop_in_place_experiment_node
+  rclcpp sensor_msgs geometry_msgs std_srvs tf2 tf2_ros)
+
 install(TARGETS imu_bias_compensator_node
   DESTINATION lib/${PROJECT_NAME}
 )
@@ -52,6 +56,7 @@ install(TARGETS imu_bias_observer
 
 install(TARGETS
   in_place_turning_experiment_node
+  estop_in_place_experiment_node
   DESTINATION lib/${PROJECT_NAME}
 )
 
