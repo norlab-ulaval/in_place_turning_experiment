@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cmath>
 #include <deque>
+#include <fstream>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <geometry_msgs/msg/twist.hpp>
 #include <geometry_msgs/msg/twist_stamped.hpp>
@@ -22,6 +23,7 @@
 #include <std_msgs/msg/string.hpp>
 #include <std_srvs/srv/trigger.hpp>
 #include <stdexcept>
+#include <vector>
 
 using namespace std::chrono_literals;
 
@@ -32,13 +34,51 @@ constexpr double kDahlSubstepSafety = 0.5;
 // Cap on the substepping, so a bad parameter set cannot stall the IMU callback.
 constexpr int kDahlMaxSubsteps = 64;
 
+// One commanded turn, as listed in the protocol file written by code/make_protocol.py. The
+// order of the runs is decided there, not here, because the rate has to be decorrelated from the
+// running order, from tire warm-up and from how worn the patch of floor is -- a sweep that simply
+// increments cannot do that. Everything but commanded_rad_s is carried so the recording can say
+// which block and patch a turn belonged to without it having to be inferred afterwards.
+struct ProtocolStep {
+  int step;
+  int block;
+  int patch;
+  int index_in_block;
+  int turns_on_patch;
+  double commanded_rad_s;  // signed; the sign is the turn direction
+};
+
+// Reads one numeric field out of a single flat JSON object. Deliberately not a general JSON
+// parser: the file is machine-written by make_protocol.py, every step object is flat, and every
+// field read here is a number, so a dependency-free reader keeps the robot image unchanged.
+static bool read_number(const std::string& object, const std::string& key, double& out) {
+  const std::string needle = "\"" + key + "\"";
+  const size_t at = object.find(needle);
+  if (at == std::string::npos) {
+    return false;
+  }
+  const size_t colon = object.find(':', at + needle.size());
+  if (colon == std::string::npos) {
+    return false;
+  }
+  try {
+    size_t used = 0;
+    out = std::stod(object.substr(colon + 1), &used);
+    return used > 0;
+  } catch (const std::exception&) {
+    return false;
+  }
+}
+
 enum class State { IDLE, ROTATING, WAITING, DONE, LOCKED };
 // IDLE: waiting for a start_experiment call, commanding zero velocity.
 // ROTATING: commanding the current run's angular velocity, accumulating rotation.
 // WAITING: velocity zeroed after reaching this run's target rotation (current velocity *
 //          min_run_time_seconds), holding for wait_time_seconds so the recoil transient can be
 //          observed before the next run starts.
-// DONE: every velocity step up to target_angular_velocity_rad has been run.
+// DONE: the current block is finished. The vehicle has to be driven to a fresh patch of floor,
+//       then start_experiment called again to run the next block. DONE is also where the node
+//       ends up once the last block of the protocol has run.
 // LOCKED: paused by an external /teleop/lock_autonomy command received during ROTATING or
 //         WAITING; on unlock, redoes the current run from scratch (current_angular_velocity_
 //         unchanged) rather than resuming where it left off.
@@ -47,9 +87,7 @@ class InPlaceTurningExperimentNode : public rclcpp::Node {
  public:
   InPlaceTurningExperimentNode() : Node("in_place_turning_experiment_node") {
     // Declare params
-    declare_parameter("start_angular_velocity_rad", 0.6);
-    declare_parameter("angular_velocity_increment_rad", 0.1);
-    declare_parameter("target_angular_velocity_rad", 3.0);
+    declare_parameter<std::string>("protocol_path", "");
     declare_parameter("min_run_time_seconds", 2.0);
     declare_parameter("wait_time_seconds", 3.0);
     declare_parameter("publish_frequency_hz", 20.0);
@@ -79,9 +117,7 @@ class InPlaceTurningExperimentNode : public rclcpp::Node {
     declare_parameter("use_twist_stamped", true);
 
     // Getting params
-    start_angular_velocity_rad_ = get_parameter("start_angular_velocity_rad").as_double();
-    angular_velocity_increment_rad_ = get_parameter("angular_velocity_increment_rad").as_double();
-    target_angular_velocity_rad_ = get_parameter("target_angular_velocity_rad").as_double();
+    protocol_path_ = get_parameter("protocol_path").as_string();
     min_run_time_seconds_ = get_parameter("min_run_time_seconds").as_double();
     wait_time_seconds_ = get_parameter("wait_time_seconds").as_double();
     publish_frequency_hz_ = get_parameter("publish_frequency_hz").as_double();
@@ -120,27 +156,10 @@ class InPlaceTurningExperimentNode : public rclcpp::Node {
       throw std::runtime_error("command_delay_seconds must be non-negative, got " +
                                std::to_string(command_delay_seconds_) + ".");
     }
-    if (angular_velocity_increment_rad_ <= 0.0) {
-      throw std::runtime_error(
-          "angular_velocity_increment_rad must be positive, otherwise the ramp never reaches "
-          "target_angular_velocity_rad. Got " +
-          std::to_string(angular_velocity_increment_rad_) + ".");
+    if (protocol_path_.empty()) {
+      throw std::runtime_error("protocol_path must be set to the protocol json written by code/make_protocol.py.");
     }
-    if (start_angular_velocity_rad_ > target_angular_velocity_rad_) {
-      throw std::runtime_error("start_angular_velocity_rad (" + std::to_string(start_angular_velocity_rad_) +
-                               ") must not exceed target_angular_velocity_rad (" +
-                               std::to_string(target_angular_velocity_rad_) + ").");
-    }
-    // All angle and speed parameters are magnitudes; direction is applied only at publish time
-    // via invert_rotation, so nothing upstream needs to reason about sign.
-    if (start_angular_velocity_rad_ <= 0.0) {
-      throw std::runtime_error("start_angular_velocity_rad must be positive, got " +
-                               std::to_string(start_angular_velocity_rad_) + ".");
-    }
-    if (target_angular_velocity_rad_ <= 0.0) {
-      throw std::runtime_error("target_angular_velocity_rad must be positive, got " +
-                               std::to_string(target_angular_velocity_rad_) + ".");
-    }
+    protocol_ = load_protocol(protocol_path_);
     if (gyro_window_size_ <= 0) {
       throw std::runtime_error("gyro_window_size must be positive, got " + std::to_string(gyro_window_size_) + ".");
     }
@@ -206,6 +225,9 @@ class InPlaceTurningExperimentNode : public rclcpp::Node {
     run_yaw_overshoot_pub_ = create_publisher<std_msgs::msg::Float64>("~/run_yaw_overshoot", 200);
     run_target_rotation_pub_ = create_publisher<std_msgs::msg::Float64>("~/run_target_rotation", 10);
     parameters_pub_ = create_publisher<std_msgs::msg::String>("~/parameters", 10);
+    // Published once per run, so the recording carries which protocol step, block and patch the
+    // turn belonged to instead of that having to be reconstructed from timestamps afterwards.
+    protocol_step_pub_ = create_publisher<std_msgs::msg::String>("~/protocol_step", 10);
 
     // Services
     start_service_ = create_service<std_srvs::srv::Trigger>(
@@ -257,8 +279,101 @@ class InPlaceTurningExperimentNode : public rclcpp::Node {
                 up_in_imu_.x(), up_in_imu_.y(), up_in_imu_.z());
   }
 
+  // Reads the "steps" array of the protocol file, in the order it is written. That order is the
+  // running order, so nothing here sorts or regroups it.
+  std::vector<ProtocolStep> load_protocol(const std::string& path) const {
+    std::ifstream file(path);
+    if (!file) {
+      throw std::runtime_error("Cannot open protocol_path '" + path + "'.");
+    }
+    std::ostringstream buffer;
+    buffer << file.rdbuf();
+    const std::string text = buffer.str();
+
+    const size_t key = text.find("\"steps\"");
+    if (key == std::string::npos) {
+      throw std::runtime_error("No \"steps\" array in protocol '" + path + "'.");
+    }
+    size_t at = text.find('[', key);
+    if (at == std::string::npos) {
+      throw std::runtime_error("Malformed \"steps\" array in protocol '" + path + "'.");
+    }
+
+    std::vector<ProtocolStep> steps;
+    for (++at; at < text.size() && text[at] != ']'; ++at) {
+      if (text[at] != '{') {
+        continue;
+      }
+      const size_t close = text.find('}', at);
+      if (close == std::string::npos) {
+        throw std::runtime_error("Unterminated step object in protocol '" + path + "'.");
+      }
+      const std::string object = text.substr(at, close - at + 1);
+
+      ProtocolStep parsed{};
+      const std::pair<const char*, int*> ints[] = {{"step", &parsed.step},
+                                                   {"block", &parsed.block},
+                                                   {"patch", &parsed.patch},
+                                                   {"index_in_block", &parsed.index_in_block},
+                                                   {"turns_on_patch", &parsed.turns_on_patch}};
+      double value = 0.0;
+      for (const auto& field : ints) {
+        if (!read_number(object, field.first, value)) {
+          throw std::runtime_error("Step " + std::to_string(steps.size() + 1) + " of protocol '" + path +
+                                   "' has no '" + field.first + "'.");
+        }
+        *field.second = static_cast<int>(std::lround(value));
+      }
+      if (!read_number(object, "commanded_rad_s", parsed.commanded_rad_s) || parsed.commanded_rad_s == 0.0) {
+        throw std::runtime_error("Step " + std::to_string(steps.size() + 1) + " of protocol '" + path +
+                                 "' has no usable 'commanded_rad_s'.");
+      }
+      steps.push_back(parsed);
+      at = close;
+    }
+
+    if (steps.empty()) {
+      throw std::runtime_error("Protocol '" + path + "' lists no steps.");
+    }
+    // A block ends where the block number changes, so the steps of a block have to be adjacent.
+    for (size_t i = 1; i < steps.size(); ++i) {
+      if (steps[i].block < steps[i - 1].block) {
+        throw std::runtime_error("Protocol '" + path + "' is not grouped by block at step " +
+                                 std::to_string(steps[i].step) + ".");
+      }
+    }
+    return steps;
+  }
+
+  // Loads the step at next_index_ into the run about to start. The magnitude drives the target
+  // rotation, which handle_rotating compares against an absolute value, so it stays positive and
+  // the direction is carried separately.
+  void load_current_step() {
+    const ProtocolStep& step = protocol_[next_index_];
+    current_angular_velocity_ = std::abs(step.commanded_rad_s);
+    current_direction_ = step.commanded_rad_s < 0.0 ? -1.0 : 1.0;
+    current_block_ = step.block;
+
+    std_msgs::msg::String step_msg;
+    step_msg.data = step_to_json(step);
+    protocol_step_pub_->publish(step_msg);
+  }
+
+  std::string step_to_json(const ProtocolStep& step) const {
+    std::ostringstream json;
+    json << std::setprecision(17);
+    json << "{"
+         << "\"step\":" << step.step << ","
+         << "\"block\":" << step.block << ","
+         << "\"patch\":" << step.patch << ","
+         << "\"index_in_block\":" << step.index_in_block << ","
+         << "\"turns_on_patch\":" << step.turns_on_patch << ","
+         << "\"commanded_rad_s\":" << step.commanded_rad_s << "}";
+    return json.str();
+  }
+
   void start_rotation_run() {
-    commanded_velocity_ = current_angular_velocity_;
+    commanded_velocity_ = current_direction_ * current_angular_velocity_;
     unwrapped_yaw_ = 0.0;
     current_run_target_rotation_rad_ = current_angular_velocity_ * min_run_time_seconds_;
 
@@ -282,25 +397,33 @@ class InPlaceTurningExperimentNode : public rclcpp::Node {
       return;
     }
 
-    current_angular_velocity_ = start_angular_velocity_rad_;
+    if (next_index_ >= protocol_.size()) {
+      response->success = false;
+      response->message = "Protocol complete, all " + std::to_string(protocol_.size()) + " steps have run.";
+      return;
+    }
+
+    load_current_step();
     start_rotation_run();
 
     std_msgs::msg::String params_msg;
     params_msg.data = parameters_to_json();
     parameters_pub_->publish(params_msg);
 
-    RCLCPP_INFO(get_logger(), "Experiment started. First velocity: %.3f rad/s", current_angular_velocity_);
+    const size_t remaining = block_end(next_index_) - next_index_;
+    RCLCPP_INFO(get_logger(), "Block %d started on patch %d, %zu turns. First command: %+.3f rad/s", current_block_,
+                protocol_[next_index_].patch, remaining, current_direction_ * current_angular_velocity_);
     response->success = true;
-    response->message = "Experiment started.";
+    response->message = "Block " + std::to_string(current_block_) + " started.";
   }
 
   std::string parameters_to_json() const {
     std::ostringstream json;
     json << std::setprecision(17);
     json << "{"
-         << "\"start_angular_velocity_rad\":" << start_angular_velocity_rad_ << ","
-         << "\"angular_velocity_increment_rad\":" << angular_velocity_increment_rad_ << ","
-         << "\"target_angular_velocity_rad\":" << target_angular_velocity_rad_ << ","
+         << "\"protocol_path\":\"" << protocol_path_ << "\","
+         << "\"protocol_steps\":" << protocol_.size() << ","
+         << "\"block\":" << current_block_ << ","
          << "\"min_run_time_seconds\":" << min_run_time_seconds_ << ","
          << "\"wait_time_seconds\":" << wait_time_seconds_ << ","
          << "\"publish_frequency_hz\":" << publish_frequency_hz_ << ","
@@ -509,13 +632,20 @@ class InPlaceTurningExperimentNode : public rclcpp::Node {
     state_ = State::WAITING;
   }
 
+  // Index one past the last step of the block that ``from`` belongs to.
+  size_t block_end(size_t from) const {
+    const int block = protocol_[from].block;
+    size_t at = from;
+    while (at < protocol_.size() && protocol_[at].block == block) {
+      ++at;
+    }
+    return at;
+  }
+
   void handle_waiting() {
     if ((now() - wait_start_time_).seconds() < wait_time_seconds_) {
       return;
     }
-
-    const double next_vel = current_angular_velocity_ + angular_velocity_increment_rad_;
-    const double target_vel = target_angular_velocity_rad_;
 
     const double overshoot = std::abs(unwrapped_yaw_) - current_run_target_rotation_rad_;
 
@@ -523,8 +653,22 @@ class InPlaceTurningExperimentNode : public rclcpp::Node {
     f.data = overshoot;
     run_yaw_overshoot_pub_->publish(f);
 
-    if (next_vel > target_vel + 1e-9) {
-      RCLCPP_INFO(get_logger(), "Experiment complete.");
+    // This run is done, so the next step of the protocol becomes the pending one.
+    ++next_index_;
+
+    // A block ends at the end of the protocol or where the block number changes. Either way the
+    // node stops here, because the vehicle has to be driven to a fresh patch of floor before the
+    // next block can start, and that is done by hand between start_experiment calls.
+    if (next_index_ >= protocol_.size() || protocol_[next_index_].block != current_block_) {
+      if (next_index_ >= protocol_.size()) {
+        RCLCPP_INFO(get_logger(), "Block %d complete. Protocol complete, all %zu steps have run.", current_block_,
+                    protocol_.size());
+      } else {
+        RCLCPP_INFO(get_logger(),
+                    "Block %d complete. Move the vehicle to a fresh patch, then call start_experiment "
+                    "to run block %d (%zu steps left).",
+                    current_block_, protocol_[next_index_].block, protocol_.size() - next_index_);
+      }
       commanded_velocity_ = 0.0;
       current_angular_velocity_ = 0.0;
       unwrapped_yaw_ = 0.0;
@@ -533,10 +677,11 @@ class InPlaceTurningExperimentNode : public rclcpp::Node {
       return;
     }
 
-    current_angular_velocity_ = next_vel;
+    load_current_step();
     start_rotation_run();
 
-    RCLCPP_INFO(get_logger(), "Starting next run at %.3f rad/s.", current_angular_velocity_);
+    RCLCPP_INFO(get_logger(), "Starting step %d of the protocol at %+.3f rad/s.", protocol_[next_index_].step,
+                current_direction_ * current_angular_velocity_);
   }
 
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
@@ -549,21 +694,24 @@ class InPlaceTurningExperimentNode : public rclcpp::Node {
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr run_yaw_overshoot_pub_;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr run_target_rotation_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr parameters_pub_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr protocol_step_pub_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr start_service_;
   rclcpp::TimerBase::SharedPtr cmd_vel_timer_;
 
   State state_{State::IDLE};
   bool has_imu_{false};
   double unwrapped_yaw_{0.0};
-  double current_angular_velocity_{0.0};
+  double current_angular_velocity_{0.0};  // magnitude; the sign lives in current_direction_
+  double current_direction_{1.0};
   double commanded_velocity_{0.0};
   double current_run_target_rotation_rad_{0.0};
   rclcpp::Time wait_start_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_imu_stamp_{0, 0, RCL_ROS_TIME};
 
-  double start_angular_velocity_rad_{0.0};
-  double angular_velocity_increment_rad_{0.0};
-  double target_angular_velocity_rad_{0.0};
+  std::string protocol_path_;
+  std::vector<ProtocolStep> protocol_;
+  size_t next_index_{0};  // protocol_ index of the step to run next
+  int current_block_{0};
   double min_run_time_seconds_{0.0};
   double wait_time_seconds_{0.0};
   double publish_frequency_hz_{0.0};
